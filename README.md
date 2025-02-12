@@ -4,8 +4,8 @@ This repository serves as a reference for the World Republic smart contracts. It
 
 - **Smart Contracts:**
 
-  - `AddressBook.sol`
+  - `Staking20Base.sol`
 
 - **Deployment Addresses:**
 
-  - `AddressBook.sol`: `0xa0cb712c053c2a57e71a679b73a26C95bf567ccf`
+  - `Staking20Base.sol`: `0xb1EeCF9c8d258876C7cEf44ab9c44Ed4CD02825e`
