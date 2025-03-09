@@ -31,6 +31,9 @@ contract ReferralReward is Ownable, ReentrancyGuard {
     // If address(0), the rewarder has not rewarded anyone yet
     mapping(address => address) public rewardedUser;
     
+    // Mapping to track how many times an address has been rewarded
+    mapping(address => uint256) public rewardCount;
+    
     // Events
     event RewardSent(address indexed sender, address indexed recipient, uint256 amount);
     event TokensDeposited(address indexed owner, uint256 amount);
@@ -70,6 +73,9 @@ contract ReferralReward is Ownable, ReentrancyGuard {
         
         // Record who the sender rewarded
         rewardedUser[msg.sender] = recipient;
+        
+        // Increment the reward count for the recipient
+        rewardCount[recipient]++;
         
         // Send the tokens
         rewardToken.safeTransfer(recipient, REWARD_AMOUNT);
@@ -112,5 +118,32 @@ contract ReferralReward is Ownable, ReentrancyGuard {
         recipient = rewardedUser[sender];
         hasRewarded = recipient != address(0);
         return (hasRewarded, recipient);
+    }
+    
+    /**
+     * @dev Gets the number of times an address has been rewarded
+     * @param user The address to check
+     * @return The number of times the address has been rewarded
+     */
+    function getRewardCount(address user) external view returns (uint256) {
+        return rewardCount[user];
+    }
+    
+    /**
+     * @dev Check if a user is eligible to reward
+     * @param user The address to check
+     * @return Whether the user can reward someone
+     */
+    function canReward(address user) external view returns (bool) {
+        return IAddressBook(ADDRESS_BOOK).addressVerifiedUntil(user) > 0 && 
+               rewardedUser[user] == address(0);
+    }
+    
+    /**
+     * @dev Gets the total token balance of the contract
+     * @return The token balance
+     */
+    function getContractBalance() external view returns (uint256) {
+        return rewardToken.balanceOf(address(this));
     }
 } 
