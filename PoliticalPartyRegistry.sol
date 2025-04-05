@@ -406,18 +406,32 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
-     * @notice Take a full membership snapshot of all active parties
-     * @dev Fix for Issue 6: Improved snapshot mechanism
-     * @return processed Number of parties processed
+     * @notice Take a membership snapshot of active parties with pagination
+     * @param _startPartyId ID to start processing from (inclusive)
+     * @param _batchSize Maximum number of parties to process in this transaction
+     * @return nextPartyId The next party ID to process (for subsequent calls)
+     * @return processed Number of parties processed in this call
      */
-    function takeSnapshot() external onlyOwner nonReentrant returns (uint256 processed) {
+    function takeSnapshotBatch(uint256 _startPartyId, uint256 _batchSize) external 
+        onlyOwner 
+        nonReentrant 
+        returns (uint256 nextPartyId, uint256 processed) 
+    {
+        require(_startPartyId < partyCount, "Invalid start ID");
+        require(_batchSize > 0, "Batch size must be positive");
+        
         uint256 currentTime = block.timestamp;
         uint256 currentBlock = block.number;
-        _lastSnapshotTime = currentTime;
         
         uint256 processedCount = 0;
+        uint256 i = _startPartyId;
+        uint256 endId = _startPartyId + _batchSize;
         
-        for (uint256 i = 0; i < partyCount; i++) {
+        if (endId > partyCount) {
+            endId = partyCount;
+        }
+        
+        for (; i < endId; i++) {
             if (parties[i].active) {
                 _partySnapshots[i].push(MembershipSnapshot({
                     timestamp: currentTime,
@@ -444,8 +458,27 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
             }
         }
         
-        emit SnapshotTaken(currentTime, currentBlock, processedCount);
-        return processedCount;
+        // Update last snapshot time only after complete snapshot
+        if (i >= partyCount) {
+            _lastSnapshotTime = currentTime;
+            emit SnapshotTaken(currentTime, currentBlock, processedCount);
+        }
+        
+        return (i < partyCount ? i : 0, processedCount);
+    }
+    
+    /**
+     * @notice Helper function to check snapshot status
+     * @return lastSnapshotTime Last time a complete snapshot was taken
+     * @return totalParties Total number of parties
+     * @return activeParties Total number of active parties
+     */
+    function getSnapshotStatus() external view returns (
+        uint256 lastSnapshotTime,
+        uint256 totalParties,
+        uint256 activeParties
+    ) {
+        return (_lastSnapshotTime, partyCount, _activePartiesCount);
     }
 
     /**
