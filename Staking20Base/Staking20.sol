@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.11;
+pragma solidity ^0.8.0;
 
 /// @author thirdweb
 
@@ -9,6 +9,11 @@ import "../eip/interface/IERC20.sol";
 import { CurrencyTransferLib } from "../lib/CurrencyTransferLib.sol";
 
 import "./interface/IStaking20.sol";
+
+// Add the interface for the World Address Book contract.
+interface IAddressBook {
+    function addressVerifiedUntil(address addr) external view returns (uint256);
+}
 
 abstract contract Staking20 is ReentrancyGuard, IStaking20 {
     /*///////////////////////////////////////////////////////////////
@@ -64,10 +69,19 @@ abstract contract Staking20 is ReentrancyGuard, IStaking20 {
     /**
      *  @notice    Stake ERC20 Tokens.
      *
-     *  @dev       See {_stake}. Override that to implement custom logic.
+     *  @dev       Staking is allowed only if the caller is verified by the World Address Book.
      */
     function stake() external nonReentrant {
         require(!hasStaked[msg.sender], "Already staked");
+
+        // Check if the sender is verified.
+        // `addressVerifiedUntil` returns zero if not verified,
+        // so require that the returned timestamp is greater than zero.
+        require(
+            IAddressBook(0x57b930D551e677CC36e2fA036Ae2fe8FdaE0330D).addressVerifiedUntil(msg.sender) > 0,
+            "Address not verified"
+        );
+
         _stake();
         hasStaked[msg.sender] = true;
     }
