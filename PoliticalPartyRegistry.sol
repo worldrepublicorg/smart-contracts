@@ -15,6 +15,11 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     // Constants
     uint256 private constant MAX_STRING_LENGTH = 256;
     uint256 private constant NOT_LEADER = type(uint256).max;
+    
+    // Party status constants
+    uint8 private constant PARTY_STATUS_PENDING = 0;
+    uint8 private constant PARTY_STATUS_ACTIVE = 1;
+    uint8 private constant PARTY_STATUS_INACTIVE = 2;
 
     // Data structures
     struct PartyStats {
@@ -38,7 +43,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         address founder;
         address currentLeader;
         uint256 creationTime;
-        bool active;
+        uint8 status; // 0=pending, 1=active, 2=inactive
         mapping(address => bool) members;
         uint256 memberCount;
         PartyStats stats;
@@ -55,6 +60,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     mapping(uint256 => Party) private parties;
     uint256 public partyCount;
     uint256 private _activePartiesCount;
+    uint256 private _pendingPartiesCount;
     
     // Optimized mappings to avoid loops
     mapping(address => uint256[]) private _userParties;
@@ -70,8 +76,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     event PartyLeft(uint256 indexed partyId, address indexed member, uint256 indexed blockNumber, uint256 timestamp);
     event MemberRemoved(uint256 indexed partyId, address indexed member, address indexed remover, uint256 timestamp);
     event LeadershipTransferred(uint256 indexed partyId, address indexed previousLeader, address indexed newLeader, bool forced, uint256 timestamp);
-    event PartyDeactivated(uint256 indexed partyId, address indexed by, uint256 indexed blockNumber, uint256 timestamp);
-    event PartyReactivated(uint256 indexed partyId, address indexed activator, uint256 timestamp);
+    event PartyStatusChanged(uint256 indexed partyId, uint8 oldStatus, uint8 newStatus, address indexed by, uint256 timestamp);
     event OfficialLinkUpdated(uint256 indexed partyId, string officialLink, uint256 timestamp);
     event PartyNameUpdated(uint256 indexed partyId, string name, uint256 timestamp);
     event PartyDescriptionUpdated(uint256 indexed partyId, string description, uint256 timestamp);
@@ -97,7 +102,12 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     }
 
     modifier partyActive(uint256 _partyId) {
-        require(parties[_partyId].active, "Party is not active");
+        require(parties[_partyId].status == PARTY_STATUS_ACTIVE, "Party is not active");
+        _;
+    }
+    
+    modifier partyPending(uint256 _partyId) {
+        require(parties[_partyId].status == PARTY_STATUS_PENDING, "Party is not pending");
         _;
     }
     
@@ -118,7 +128,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
-     * @notice Create a new political party
+     * @notice Create a new political party (in pending state)
      * @param _name Name of the party
      * @param _description Brief description of the party
      * @param _officialLink Link to party website or community
@@ -146,7 +156,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         party.founder = msg.sender;
         party.currentLeader = msg.sender;
         party.creationTime = block.timestamp;
-        party.active = true;
+        party.status = PARTY_STATUS_PENDING; // Start in pending state
         party.members[msg.sender] = true;
         party.memberCount = 1;
         
@@ -154,7 +164,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         
         _userParties[msg.sender].push(newPartyId);
         _userLeaderships[msg.sender].push(newPartyId);
-        _activePartiesCount++;
+        _pendingPartiesCount++;
         
         emit PartyCreated(newPartyId, _name, msg.sender, msg.sender, block.timestamp);
         return newPartyId;
@@ -249,6 +259,12 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         require(parties[_partyId].members[_newLeader], "New leader must be a party member");
         require(_newLeader != msg.sender, "Already the leader");
         
+        // Check if the new leader already leads an active party
+        (bool hasLeadership, ) = _hasActiveLeadership(_newLeader);
+        if (hasLeadership) {
+            revert("New leader already leads an active party");
+        }
+        
         address previousLeader = parties[_partyId].currentLeader;
         parties[_partyId].currentLeader = _newLeader;
         
@@ -328,17 +344,23 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     {
         require(msg.sender == owner() || msg.sender == parties[_partyId].currentLeader, 
                 "Only owner or leader can deactivate");
-        require(parties[_partyId].active, "Party already inactive");
+        require(parties[_partyId].status != PARTY_STATUS_INACTIVE, "Party already inactive");
         
-        parties[_partyId].active = false;
+        uint8 oldStatus = parties[_partyId].status;
+        parties[_partyId].status = PARTY_STATUS_INACTIVE;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
-        _activePartiesCount--;
         
-        emit PartyDeactivated(_partyId, msg.sender, block.number, block.timestamp);
+        if (oldStatus == PARTY_STATUS_ACTIVE) {
+            _activePartiesCount--;
+        } else if (oldStatus == PARTY_STATUS_PENDING) {
+            _pendingPartiesCount--;
+        }
+        
+        emit PartyStatusChanged(_partyId, oldStatus, PARTY_STATUS_INACTIVE, msg.sender, block.timestamp);
     }
 
     /**
-     * @notice Reactivate a party (only owner)
+     * @notice Reactivate a party (only owner) - Sets to pending state, not active
      * @param _partyId ID of the party to reactivate
      */
     function reactivateParty(uint256 _partyId) external 
@@ -347,13 +369,40 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         whenNotPaused
         nonReentrant
     {
-        require(!parties[_partyId].active, "Party already active");
+        require(parties[_partyId].status == PARTY_STATUS_INACTIVE, "Party not inactive");
         
-        parties[_partyId].active = true;
+        parties[_partyId].status = PARTY_STATUS_PENDING;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
+        _pendingPartiesCount++;
+        
+        emit PartyStatusChanged(_partyId, PARTY_STATUS_INACTIVE, PARTY_STATUS_PENDING, msg.sender, block.timestamp);
+    }
+    
+    /**
+     * @notice Approve a pending party (only owner)
+     * @param _partyId ID of the party to approve
+     */
+    function approveParty(uint256 _partyId) external 
+        partyExists(_partyId) 
+        partyPending(_partyId) 
+        onlyOwner
+        whenNotPaused
+        nonReentrant
+    {
+        address leader = parties[_partyId].currentLeader;
+        
+        // Check if the leader already leads an active party
+        (bool hasLeadership, ) = _hasActiveLeadership(leader);
+        if (hasLeadership) {
+            revert("Leader already has an active party");
+        }
+        
+        parties[_partyId].status = PARTY_STATUS_ACTIVE;
+        parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
+        _pendingPartiesCount--;
         _activePartiesCount++;
         
-        emit PartyReactivated(_partyId, msg.sender, block.timestamp);
+        emit PartyStatusChanged(_partyId, PARTY_STATUS_PENDING, PARTY_STATUS_ACTIVE, msg.sender, block.timestamp);
     }
 
     /**
@@ -369,6 +418,14 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     {
         require(_newLeader != address(0), "Zero address");
         require(parties[_partyId].members[_newLeader], "New leader must be a party member");
+        
+        // For active parties, check if the new leader already leads an active party
+        if (parties[_partyId].status == PARTY_STATUS_ACTIVE) {
+            (bool hasLeadership, uint256 leadPartyId) = _hasActiveLeadership(_newLeader);
+            if (hasLeadership && leadPartyId != _partyId) {
+                revert("New leader already leads an active party");
+            }
+        }
         
         address previousLeader = parties[_partyId].currentLeader;
         parties[_partyId].currentLeader = _newLeader;
@@ -432,7 +489,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         }
         
         for (; i < endId; i++) {
-            if (parties[i].active) {
+            if (parties[i].status == PARTY_STATUS_ACTIVE) {
                 _partySnapshots[i].push(MembershipSnapshot({
                     timestamp: currentTime,
                     blockNumber: currentBlock,
@@ -472,13 +529,15 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      * @return lastSnapshotTime Last time a complete snapshot was taken
      * @return totalParties Total number of parties
      * @return activeParties Total number of active parties
+     * @return pendingParties Total number of pending parties
      */
     function getSnapshotStatus() external view returns (
         uint256 lastSnapshotTime,
         uint256 totalParties,
-        uint256 activeParties
+        uint256 activeParties,
+        uint256 pendingParties
     ) {
-        return (_lastSnapshotTime, partyCount, _activePartiesCount);
+        return (_lastSnapshotTime, partyCount, _activePartiesCount, _pendingPartiesCount);
     }
 
     /**
@@ -602,6 +661,22 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         change.forced = _forced;
     }
 
+    /**
+     * @dev Checks if an address already leads an active party
+     * @param _address Address to check
+     * @return hasLeadership Whether the address already leads an active party
+     * @return leadPartyId The ID of the active party led by this address (if any)
+     */
+    function _hasActiveLeadership(address _address) internal view returns (bool hasLeadership, uint256 leadPartyId) {
+        for (uint256 i = 0; i < _userLeaderships[_address].length; i++) {
+            uint256 partyId = _userLeaderships[_address][i];
+            if (parties[partyId].status == PARTY_STATUS_ACTIVE) {
+                return (true, partyId);
+            }
+        }
+        return (false, 0);
+    }
+
     // View functions
 
     /**
@@ -626,7 +701,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      * @return founder Address of the party founder
      * @return currentLeader Address of the current party leader
      * @return creationTime Timestamp when the party was created
-     * @return active Whether the party is currently active
+     * @return status Party status (0=pending, 1=active, 2=inactive)
      * @return memberCount Number of members in the party
      */
     function getPartyDetails(uint256 _partyId) external view 
@@ -638,7 +713,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
             address founder,
             address currentLeader,
             uint256 creationTime,
-            bool active,
+            uint8 status,
             uint256 memberCount
         ) 
     {
@@ -650,7 +725,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
             party.founder,
             party.currentLeader,
             party.creationTime,
-            party.active,
+            party.status,
             party.memberCount
         );
     }
@@ -732,9 +807,9 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
-     * @notice Get all parties a user leads
+     * @notice Get all parties a user leads (includes active, pending, and inactive)
      * @param _user Address of the user
-     * @return Array of party IDs the user leads
+     * @return Array of party IDs the user leads in any status
      */
     function getUserLeaderships(address _user) external view returns (uint256[] memory) {
         require(_user != address(0), "Zero address");
@@ -742,9 +817,9 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
-     * @notice Check if user is a leader of any parties
+     * @notice Check if user is a leader of any parties (in any status)
      * @param _user Address of the user
-     * @return isLeader Whether the user is a leader
+     * @return isLeader Whether the user is a leader of any party
      * @return leadershipCount Number of parties the user leads
      */
     function isUserLeader(address _user) external view returns (bool isLeader, uint256 leadershipCount) {
@@ -759,5 +834,35 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      */
     function getActivePartyCount() external view returns (uint256) {
         return _activePartiesCount;
+    }
+    
+    /**
+     * @notice Get total number of pending parties
+     * @return Number of pending parties
+     */
+    function getPendingPartyCount() external view returns (uint256) {
+        return _pendingPartiesCount;
+    }
+    
+    /**
+     * @notice Get status of a party
+     * @param _partyId ID of the party
+     * @return status Party status (0=pending, 1=active, 2=inactive)
+     */
+    function getPartyStatus(uint256 _partyId) external view
+        partyExists(_partyId)
+        returns (uint8)
+    {
+        return parties[_partyId].status;
+    }
+
+    /**
+     * @notice Check if a user already leads an active party
+     * @param _user The address of the user to check
+     * @return hasLeadership Whether the user leads an active party
+     * @return leadPartyId The ID of the active party they lead (if any)
+     */
+    function hasActiveLeadership(address _user) external view returns (bool hasLeadership, uint256 leadPartyId) {
+        return _hasActiveLeadership(_user);
     }
 }
