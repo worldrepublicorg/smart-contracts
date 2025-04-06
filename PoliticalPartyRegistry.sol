@@ -101,11 +101,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         _;
     }
 
-    modifier partyActive(uint256 _partyId) {
-        require(parties[_partyId].status == PARTY_STATUS_ACTIVE, "Party is not active");
-        _;
-    }
-    
     modifier partyPending(uint256 _partyId) {
         require(parties[_partyId].status == PARTY_STATUS_PENDING, "Party is not pending");
         _;
@@ -176,7 +171,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      */
     function joinParty(uint256 _partyId) external 
         partyExists(_partyId) 
-        partyActive(_partyId) 
         whenNotPaused
         nonReentrant
     {
@@ -223,7 +217,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      */
     function removeMember(uint256 _partyId, address _member) external
         partyExists(_partyId)
-        partyActive(_partyId)
         onlyPartyLeader(_partyId)
         whenNotPaused
         nonReentrant
@@ -250,7 +243,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      */
     function transferLeadership(uint256 _partyId, address _newLeader) external 
         partyExists(_partyId) 
-        partyActive(_partyId) 
         onlyPartyLeader(_partyId)
         whenNotPaused
         nonReentrant
@@ -259,10 +251,12 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         require(parties[_partyId].members[_newLeader], "New leader must be a party member");
         require(_newLeader != msg.sender, "Already the leader");
         
-        // Check if the new leader already leads an active party
-        (bool hasLeadership, ) = _hasActiveLeadership(_newLeader);
-        if (hasLeadership) {
-            revert("New leader already leads an active party");
+        // For active parties, check if the new leader already leads an active party
+        if (parties[_partyId].status == PARTY_STATUS_ACTIVE) {
+            (bool hasLeadership, ) = _hasActiveLeadership(_newLeader);
+            if (hasLeadership) {
+                revert("New leader already leads an active party");
+            }
         }
         
         address previousLeader = parties[_partyId].currentLeader;
@@ -286,7 +280,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      */
     function updateOfficialLink(uint256 _partyId, string memory _officialLink) external 
         partyExists(_partyId) 
-        partyActive(_partyId) 
         onlyPartyLeader(_partyId)
         whenNotPaused
         validString(_officialLink)
@@ -304,7 +297,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      */
     function updatePartyName(uint256 _partyId, string memory _name) external 
         partyExists(_partyId) 
-        partyActive(_partyId) 
         onlyPartyLeader(_partyId)
         whenNotPaused
         validString(_name)
@@ -322,7 +314,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      */
     function updatePartyDescription(uint256 _partyId, string memory _description) external 
         partyExists(_partyId) 
-        partyActive(_partyId) 
         onlyPartyLeader(_partyId)
         whenNotPaused
         validString(_description)
