@@ -6,15 +6,27 @@ import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
+ * @title IAddressBook
+ * @dev Interface for the contract that stores verified World ID addresses
+ */
+interface IAddressBook {
+    function addressVerifiedUntil(address addr) external view returns (uint256);
+}
+
+/**
  * @title PoliticalPartyRegistry
- * @notice A contract to manage political parties with changeable leadership
+ * @notice A contract to manage political parties
  * @dev Implements a system for party creation, management, and statistical tracking
  * @custom:security-contact security@example.com
  */
 contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     // Constants
     uint256 private constant MAX_STRING_LENGTH = 256;
+    uint256 private constant MAX_SHORT_NAME_LENGTH = 16;
     uint256 private constant NOT_LEADER = type(uint256).max;
+    
+    // Address Book contract address
+    address public addressBookContract = 0x57b930D551e677CC36e2fA036Ae2fe8FdaE0330D;
     
     // Party status constants
     uint8 private constant PARTY_STATUS_PENDING = 0;
@@ -38,6 +50,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     
     struct Party {
         string name;
+        string shortName;
         string description;
         string officialLink;
         address founder;
@@ -46,6 +59,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         uint8 status; // 0=pending, 1=active, 2=inactive
         mapping(address => bool) members;
         uint256 memberCount;
+        uint256 verifiedMemberCount; // Count of Orb-verified members
         PartyStats stats;
         LeadershipChange[] leadershipHistory;
     }
@@ -54,6 +68,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         uint256 timestamp;
         uint256 blockNumber;
         uint256 memberCount;
+        uint256 verifiedMemberCount;
     }
 
     // State variables
@@ -72,9 +87,9 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     
     // Events with enhanced information
     event PartyCreated(uint256 indexed partyId, string name, address indexed founder, address indexed initialLeader, uint256 timestamp);
-    event PartyJoined(uint256 indexed partyId, address indexed member, uint256 indexed blockNumber, uint256 timestamp);
-    event PartyLeft(uint256 indexed partyId, address indexed member, uint256 indexed blockNumber, uint256 timestamp);
-    event MemberRemoved(uint256 indexed partyId, address indexed member, address indexed remover, uint256 timestamp);
+    event PartyJoined(uint256 indexed partyId, address indexed member, uint256 indexed blockNumber, uint256 timestamp, bool isVerified);
+    event PartyLeft(uint256 indexed partyId, address indexed member, uint256 indexed blockNumber, uint256 timestamp, bool wasVerified);
+    event MemberRemoved(uint256 indexed partyId, address indexed member, address indexed remover, uint256 timestamp, bool wasVerified);
     event LeadershipTransferred(uint256 indexed partyId, address indexed previousLeader, address indexed newLeader, bool forced, uint256 timestamp);
     event PartyStatusChanged(uint256 indexed partyId, uint8 oldStatus, uint8 newStatus, address indexed by, uint256 timestamp);
     event OfficialLinkUpdated(uint256 indexed partyId, string officialLink, uint256 timestamp);
@@ -82,8 +97,9 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     event PartyDescriptionUpdated(uint256 indexed partyId, string description, uint256 timestamp);
     event EmergencyPause(bool indexed paused, address indexed by, uint256 timestamp);
     event SnapshotTaken(uint256 indexed timestamp, uint256 indexed blockNumber, uint256 partiesProcessed);
-    event PartyMembershipSnapshot(uint256 indexed partyId, uint256 indexed snapshotId, uint256 memberCount, uint256 timestamp);
+    event PartyMembershipSnapshot(uint256 indexed partyId, uint256 indexed snapshotId, uint256 memberCount, uint256 verifiedMemberCount, uint256 timestamp);
     event RegistryDeployed(address indexed initialOwner, uint256 timestamp);
+    event PartyShortNameUpdated(uint256 indexed partyId, string shortName, uint256 timestamp);
 
     // Modifiers
     modifier onlyPartyMember(uint256 _partyId) {
@@ -112,6 +128,12 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         _;
     }
 
+    modifier validShortName(string memory str) {
+        require(bytes(str).length > 0, "String cannot be empty");
+        require(bytes(str).length <= MAX_SHORT_NAME_LENGTH, "Short name too long");
+        _;
+    }
+
     /**
      * @notice Initialize the contract with owner address
      * @param initialOwner The initial owner of the contract
@@ -121,16 +143,27 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     {
         emit RegistryDeployed(initialOwner, block.timestamp);
     }
+    
+    /**
+     * @notice Check if an address is verified in the Address Book
+     * @param _address Address to check
+     * @return True if the address has valid verification
+     */
+    function isAddressVerified(address _address) public view returns (bool) {
+        return IAddressBook(addressBookContract).addressVerifiedUntil(_address) > 0;
+    }
 
     /**
      * @notice Create a new political party (in pending state)
      * @param _name Name of the party
+     * @param _shortName Short name/abbreviation of the party
      * @param _description Brief description of the party
-     * @param _officialLink Link to party website or community
+     * @param _officialLink Link to party website or community (can be empty)
      * @return partyId ID of the created party
      */
     function createParty(
-        string memory _name, 
+        string memory _name,
+        string memory _shortName,
         string memory _description, 
         string memory _officialLink
     ) 
@@ -138,14 +171,15 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         whenNotPaused 
         nonReentrant
         validString(_name)
+        validShortName(_shortName)
         validString(_description)
-        validString(_officialLink)
         returns (uint256 partyId)
     {
         uint256 newPartyId = partyCount++;
         Party storage party = parties[newPartyId];
         
         party.name = _name;
+        party.shortName = _shortName;
         party.description = _description;
         party.officialLink = _officialLink;
         party.founder = msg.sender;
@@ -154,6 +188,14 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         party.status = PARTY_STATUS_PENDING; // Start in pending state
         party.members[msg.sender] = true;
         party.memberCount = 1;
+        
+        // Check if founder is verified
+        bool isVerified = isAddressVerified(msg.sender);
+        if (isVerified) {
+            party.verifiedMemberCount = 1;
+        } else {
+            party.verifiedMemberCount = 0;
+        }
         
         party.stats.lastActivityTimestamp = block.timestamp;
         
@@ -179,12 +221,18 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         parties[_partyId].members[msg.sender] = true;
         parties[_partyId].memberCount++;
         
+        // Check if new member is verified
+        bool isVerified = isAddressVerified(msg.sender);
+        if (isVerified) {
+            parties[_partyId].verifiedMemberCount++;
+        }
+        
         _userParties[msg.sender].push(_partyId);
         
         parties[_partyId].stats.memberJoins++;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         
-        emit PartyJoined(_partyId, msg.sender, block.number, block.timestamp);
+        emit PartyJoined(_partyId, msg.sender, block.number, block.timestamp, isVerified);
     }
 
     /**
@@ -199,15 +247,22 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     {
         require(msg.sender != parties[_partyId].currentLeader, "Current leader cannot leave");
         
+        // Check if leaving member is verified before removing
+        bool wasVerified = isAddressVerified(msg.sender);
+        
         parties[_partyId].members[msg.sender] = false;
         parties[_partyId].memberCount--;
+        
+        if (wasVerified) {
+            parties[_partyId].verifiedMemberCount--;
+        }
         
         _removeFromUserParties(msg.sender, _partyId);
         
         parties[_partyId].stats.memberLeaves++;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         
-        emit PartyLeft(_partyId, msg.sender, block.number, block.timestamp);
+        emit PartyLeft(_partyId, msg.sender, block.number, block.timestamp, wasVerified);
     }
     
     /**
@@ -225,15 +280,22 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         require(parties[_partyId].members[_member], "Not a member");
         require(_member != parties[_partyId].currentLeader, "Cannot remove leader");
         
+        // Check if member being removed is verified
+        bool wasVerified = isAddressVerified(_member);
+        
         parties[_partyId].members[_member] = false;
         parties[_partyId].memberCount--;
+        
+        if (wasVerified) {
+            parties[_partyId].verifiedMemberCount--;
+        }
         
         _removeFromUserParties(_member, _partyId);
         
         parties[_partyId].stats.memberLeaves++;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         
-        emit MemberRemoved(_partyId, _member, msg.sender, block.timestamp);
+        emit MemberRemoved(_partyId, _member, msg.sender, block.timestamp, wasVerified);
     }
 
     /**
@@ -274,23 +336,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
-     * @notice Update party's official link
-     * @param _partyId ID of the party
-     * @param _officialLink New official link
-     */
-    function updateOfficialLink(uint256 _partyId, string memory _officialLink) external 
-        partyExists(_partyId) 
-        onlyPartyLeader(_partyId)
-        whenNotPaused
-        validString(_officialLink)
-    {
-        parties[_partyId].officialLink = _officialLink;
-        parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
-        
-        emit OfficialLinkUpdated(_partyId, _officialLink, block.timestamp);
-    }
-
-    /**
      * @notice Update party's name
      * @param _partyId ID of the party
      * @param _name New party name
@@ -308,6 +353,23 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
+     * @notice Update party's short name
+     * @param _partyId ID of the party
+     * @param _shortName New party short name
+     */
+    function updatePartyShortName(uint256 _partyId, string memory _shortName) external 
+        partyExists(_partyId) 
+        onlyPartyLeader(_partyId)
+        whenNotPaused
+        validShortName(_shortName)
+    {
+        parties[_partyId].shortName = _shortName;
+        parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
+        
+        emit PartyShortNameUpdated(_partyId, _shortName, block.timestamp);
+    }
+
+    /**
      * @notice Update party's description
      * @param _partyId ID of the party
      * @param _description New party description
@@ -322,6 +384,23 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         
         emit PartyDescriptionUpdated(_partyId, _description, block.timestamp);
+    }
+
+    /**
+     * @notice Update party's official link
+     * @param _partyId ID of the party
+     * @param _officialLink New official link
+     */
+    function updateOfficialLink(uint256 _partyId, string memory _officialLink) external 
+        partyExists(_partyId) 
+        onlyPartyLeader(_partyId)
+        whenNotPaused
+        validString(_officialLink)
+    {
+        parties[_partyId].officialLink = _officialLink;
+        parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
+        
+        emit OfficialLinkUpdated(_partyId, _officialLink, block.timestamp);
     }
 
     /**
@@ -484,7 +563,8 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
                 _partySnapshots[i].push(MembershipSnapshot({
                     timestamp: currentTime,
                     blockNumber: currentBlock,
-                    memberCount: parties[i].memberCount
+                    memberCount: parties[i].memberCount,
+                    verifiedMemberCount: parties[i].verifiedMemberCount
                 }));
                 
                 if (_snapshotRetentionCount > 0 && _partySnapshots[i].length > _snapshotRetentionCount) {
@@ -501,7 +581,8 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
                     }
                 }
                 
-                emit PartyMembershipSnapshot(i, _partySnapshots[i].length - 1, parties[i].memberCount, currentTime);
+                emit PartyMembershipSnapshot(i, _partySnapshots[i].length - 1, parties[i].memberCount, 
+                    parties[i].verifiedMemberCount, currentTime);
                 processedCount++;
             }
         }
@@ -537,15 +618,16 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      * @return timestamp When the snapshot was taken
      * @return blockNumber Block number when snapshot was taken
      * @return memberCount Number of members at snapshot time
+     * @return verifiedMemberCount Number of verified members at snapshot time
      */
     function getLatestPartySnapshot(uint256 _partyId) external view
         partyExists(_partyId)
-        returns (uint256 timestamp, uint256 blockNumber, uint256 memberCount)
+        returns (uint256 timestamp, uint256 blockNumber, uint256 memberCount, uint256 verifiedMemberCount)
     {
         require(_partySnapshots[_partyId].length > 0, "No snapshots exist for this party");
         
         MembershipSnapshot storage snapshot = _partySnapshots[_partyId][_partySnapshots[_partyId].length - 1];
-        return (snapshot.timestamp, snapshot.blockNumber, snapshot.memberCount);
+        return (snapshot.timestamp, snapshot.blockNumber, snapshot.memberCount, snapshot.verifiedMemberCount);
     }
 
     /**
@@ -555,6 +637,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      * @param _count Number of snapshots to retrieve
      * @return timestamps Array of snapshot timestamps
      * @return memberCounts Array of member counts
+     * @return verifiedMemberCounts Array of verified member counts
      */
     function getPartySnapshotHistory(
         uint256 _partyId, 
@@ -566,7 +649,8 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         partyExists(_partyId)
         returns (
             uint256[] memory timestamps,
-            uint256[] memory memberCounts
+            uint256[] memory memberCounts,
+            uint256[] memory verifiedMemberCounts
         ) 
     {
         uint256 snapshotCount = _partySnapshots[_partyId].length;
@@ -581,14 +665,16 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         uint256 resultSize = endIndex - _startIndex;
         timestamps = new uint256[](resultSize);
         memberCounts = new uint256[](resultSize);
+        verifiedMemberCounts = new uint256[](resultSize);
         
         for (uint256 i = 0; i < resultSize; i++) {
             uint256 index = _startIndex + i;
             timestamps[i] = _partySnapshots[_partyId][index].timestamp;
             memberCounts[i] = _partySnapshots[_partyId][index].memberCount;
+            verifiedMemberCounts[i] = _partySnapshots[_partyId][index].verifiedMemberCount;
         }
         
-        return (timestamps, memberCounts);
+        return (timestamps, memberCounts, verifiedMemberCounts);
     }
 
     /**
@@ -687,37 +773,43 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
      * @notice Get party details
      * @param _partyId ID of the party
      * @return name The name of the party
+     * @return shortName The short name/abbreviation of the party
      * @return description Brief description of the party
      * @return officialLink Link to party website or community
      * @return founder Address of the party founder
      * @return currentLeader Address of the current party leader
      * @return creationTime Timestamp when the party was created
      * @return status Party status (0=pending, 1=active, 2=inactive)
-     * @return memberCount Number of members in the party
+     * @return memberCount Total number of members in the party
+     * @return verifiedMemberCount Number of verified members in the party
      */
     function getPartyDetails(uint256 _partyId) external view 
         partyExists(_partyId) 
         returns (
             string memory name,
+            string memory shortName,
             string memory description,
             string memory officialLink,
             address founder,
             address currentLeader,
             uint256 creationTime,
             uint8 status,
-            uint256 memberCount
+            uint256 memberCount,
+            uint256 verifiedMemberCount
         ) 
     {
         Party storage party = parties[_partyId];
         return (
             party.name,
+            party.shortName,
             party.description,
             party.officialLink,
             party.founder,
             party.currentLeader,
             party.creationTime,
             party.status,
-            party.memberCount
+            party.memberCount,
+            party.verifiedMemberCount
         );
     }
     
