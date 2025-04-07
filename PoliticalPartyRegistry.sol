@@ -5,6 +5,36 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
+// ByteHasher library for World ID integration
+library ByteHasher {
+    /// @dev Creates a keccak256 hash of a bytestring.
+    /// @param value The bytestring to hash
+    /// @return The hash of the specified value
+    /// @dev `>> 8` makes sure that the result is included in our field
+    function hashToField(bytes memory value) internal pure returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(value))) >> 8;
+    }
+}
+
+// World ID interface
+interface IWorldID {
+    /// @notice Reverts if the zero-knowledge proof is invalid.
+    /// @param root The of the Merkle tree
+    /// @param groupId The id of the Semaphore group
+    /// @param signalHash A keccak256 hash of the Semaphore signal
+    /// @param nullifierHash The nullifier hash
+    /// @param externalNullifierHash A keccak256 hash of the external nullifier
+    /// @param proof The zero-knowledge proof
+    function verifyProof(
+        uint256 root,
+        uint256 groupId,
+        uint256 signalHash,
+        uint256 nullifierHash,
+        uint256 externalNullifierHash,
+        uint256[8] calldata proof
+    ) external view;
+}
+
 /**
  * @title IAddressBook
  * @dev Interface for the contract that stores verified World ID addresses
@@ -20,7 +50,7 @@ interface IAddressBook {
 interface IPoliticalPartyRegistry {
     function getPartyStatus(uint256 _partyId) external view returns (uint8);
     function getPartyCount() external view returns (uint256);
-    function getPartyMemberCounts(uint256 _partyId) external view returns (uint256 memberCount, uint256 verifiedMemberCount);
+    function getPartyMemberCounts(uint256 _partyId) external view returns (uint256 memberCount, uint256 documentVerifiedMemberCount, uint256 verifiedMemberCount);
 }
 
 /**
@@ -30,6 +60,8 @@ interface IPoliticalPartyRegistry {
  * @custom:security-contact security@example.com
  */
 contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPoliticalPartyRegistry {
+    using ByteHasher for bytes;
+
     // ================ CUSTOM ERRORS ================
     error ZeroAddress();
     error InvalidPartyId();
@@ -51,17 +83,20 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
     error CannotRemoveLeader();
     error NewLeaderAlreadyLeadsActiveParty();
     error AlreadyLeader();
+    error NullifierHashAlreadyUsed();
+    error InvalidProof();
     
     // ================ CONSTANTS ================
     uint256 private constant MAX_STRING_LENGTH = 256;
     uint256 private constant MAX_SHORT_NAME_LENGTH = 16;
     uint256 private constant NOT_LEADER = type(uint256).max;
     
-    // Party status constants
-    uint8 private constant PARTY_STATUS_PENDING = 0;
-    uint8 private constant PARTY_STATUS_ACTIVE = 1;
-    uint8 private constant PARTY_STATUS_INACTIVE = 2;
-
+    // Party status enum instead of constants
+    enum PartyStatus { PENDING, ACTIVE, INACTIVE }
+    
+    // World ID constants
+    uint256 internal constant GROUP_ID = 1;
+    
     // ================ DATA STRUCTURES ================
     struct PartyStats {
         uint256 leadershipChanges;
@@ -85,9 +120,10 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         address founder;
         address currentLeader;
         uint256 creationTime;
-        uint8 status; // 0=pending, 1=active, 2=inactive
+        PartyStatus status;
         mapping(address => bool) members;
         uint256 memberCount;
+        uint256 documentVerifiedMemberCount; // Count of document-verified members
         uint256 verifiedMemberCount; // Count of Orb-verified members
         PartyStats stats;
         LeadershipChange[] leadershipHistory;
@@ -96,6 +132,16 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
     // ================ STATE VARIABLES ================
     // Address Book contract address - should be made configurable
     address public addressBookContract;
+    
+    // World ID integration
+    IWorldID public worldId;
+    uint256 internal externalNullifier;
+    
+    // Mapping to track verified World ID nullifier hashes
+    mapping(uint256 => bool) public nullifierHashes;
+    
+    // Mapping to track document-verified party members
+    mapping(address => bool) public documentVerifiedMembers;
     
     // Party storage
     mapping(uint256 => Party) private parties;
@@ -109,9 +155,9 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
     
     // ================ EVENTS ================
     event PartyCreated(uint256 indexed partyId, string name, address indexed founder, address indexed initialLeader, uint256 timestamp);
-    event PartyJoined(uint256 indexed partyId, address indexed member, uint256 blockNumber, uint256 timestamp, bool isVerified);
-    event PartyLeft(uint256 indexed partyId, address indexed member, uint256 blockNumber, uint256 timestamp, bool wasVerified);
-    event MemberRemoved(uint256 indexed partyId, address indexed member, address indexed remover, uint256 timestamp, bool wasVerified);
+    event PartyJoined(uint256 indexed partyId, address indexed member, uint256 blockNumber, uint256 timestamp, bool isVerified, bool isDocumentVerified);
+    event PartyLeft(uint256 indexed partyId, address indexed member, uint256 blockNumber, uint256 timestamp, bool wasVerified, bool wasDocumentVerified);
+    event MemberRemoved(uint256 indexed partyId, address indexed member, address indexed remover, uint256 timestamp, bool wasVerified, bool wasDocumentVerified);
     event LeadershipTransferred(uint256 indexed partyId, address indexed previousLeader, address indexed newLeader, bool forced, uint256 timestamp);
     event PartyStatusChanged(uint256 indexed partyId, uint8 oldStatus, uint8 newStatus, address indexed by, uint256 timestamp);
     event OfficialLinkUpdated(uint256 indexed partyId, string officialLink, uint256 timestamp);
@@ -119,10 +165,12 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
     event PartyDescriptionUpdated(uint256 indexed partyId, string description, uint256 timestamp);
     event EmergencyPause(bool indexed paused, address indexed by, uint256 timestamp);
     event SnapshotTaken(uint256 timestamp, uint256 blockNumber, uint256 partiesProcessed);
-    event PartyMembershipSnapshot(uint256 indexed partyId, uint256 snapshotId, uint256 memberCount, uint256 verifiedMemberCount, uint256 timestamp);
+    event PartyMembershipSnapshot(uint256 indexed partyId, uint256 snapshotId, uint256 memberCount, uint256 verifiedMemberCount, uint256 documentVerifiedMemberCount, uint256 timestamp);
     event RegistryDeployed(address indexed initialOwner, uint256 timestamp);
     event PartyShortNameUpdated(uint256 indexed partyId, string shortName, uint256 timestamp);
     event AddressBookUpdated(address indexed oldAddress, address indexed newAddress);
+    event WorldIdVerified(address indexed member, uint256 nullifierHash, uint256 timestamp);
+    event WorldIdUpdated(address indexed oldWorldId, address indexed newWorldId);
 
     // ================ MODIFIERS ================
     modifier onlyPartyMember(uint256 _partyId) {
@@ -141,7 +189,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
     }
 
     modifier partyPending(uint256 _partyId) {
-        if (parties[_partyId].status != PARTY_STATUS_PENDING) revert PartyNotPending();
+        if (parties[_partyId].status != PartyStatus.PENDING) revert PartyNotPending();
         _;
     }
     
@@ -159,15 +207,29 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
 
     // ================ CONSTRUCTOR ================
     /**
-     * @notice Initialize the contract with owner address and address book
+     * @notice Initialize the contract with owner address, address book, and World ID
      * @param initialOwner The initial owner of the contract
      * @param _addressBookContract The address of the World ID verification contract
+     * @param _worldId The World ID contract address
+     * @param _appId The World ID app ID
+     * @param _actionId The World ID action ID for this specific action
      */
-    constructor(address initialOwner, address _addressBookContract) 
+    constructor(
+        address initialOwner, 
+        address _addressBookContract,
+        IWorldID _worldId,
+        string memory _appId,
+        string memory _actionId
+    ) 
         Ownable(initialOwner) 
     {
         if (_addressBookContract == address(0)) revert ZeroAddress();
         addressBookContract = _addressBookContract;
+        
+        // Initialize World ID verification
+        worldId = _worldId;
+        externalNullifier = abi.encodePacked(abi.encodePacked(_appId).hashToField(), _actionId).hashToField();
+        
         emit RegistryDeployed(initialOwner, block.timestamp);
     }
     
@@ -206,16 +268,24 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         party.founder = msg.sender;
         party.currentLeader = msg.sender;
         party.creationTime = block.timestamp;
-        party.status = PARTY_STATUS_PENDING; // Start in pending state
+        party.status = PartyStatus.PENDING;
         party.members[msg.sender] = true;
         party.memberCount = 1;
         
-        // Check if founder is verified
+        // Check if founder is verified with Orb
         bool isVerified = isAddressVerified(msg.sender);
         if (isVerified) {
             party.verifiedMemberCount = 1;
         } else {
             party.verifiedMemberCount = 0;
+        }
+        
+        // Check if founder is document verified
+        bool isDocumentVerified = documentVerifiedMembers[msg.sender];
+        if (isDocumentVerified) {
+            party.documentVerifiedMemberCount = 1;
+        } else {
+            party.documentVerifiedMemberCount = 0;
         }
         
         party.stats.lastActivityTimestamp = block.timestamp;
@@ -247,12 +317,13 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
             revert LeaderHasActiveParty();
         }
         
-        parties[_partyId].status = PARTY_STATUS_ACTIVE;
+        PartyStatus oldStatus = parties[_partyId].status;
+        parties[_partyId].status = PartyStatus.ACTIVE;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         _pendingPartiesCount--;
         _activePartiesCount++;
         
-        emit PartyStatusChanged(_partyId, PARTY_STATUS_PENDING, PARTY_STATUS_ACTIVE, msg.sender, block.timestamp);
+        emit PartyStatusChanged(_partyId, uint8(oldStatus), uint8(PartyStatus.ACTIVE), msg.sender, block.timestamp);
     }
     
     /**
@@ -267,21 +338,21 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         if (msg.sender != owner() && msg.sender != parties[_partyId].currentLeader) {
             revert NotOwnerOrLeader();
         }
-        if (parties[_partyId].status == PARTY_STATUS_INACTIVE) {
+        if (parties[_partyId].status == PartyStatus.INACTIVE) {
             revert PartyAlreadyInactive();
         }
         
-        uint8 oldStatus = parties[_partyId].status;
-        parties[_partyId].status = PARTY_STATUS_INACTIVE;
+        PartyStatus oldStatus = parties[_partyId].status;
+        parties[_partyId].status = PartyStatus.INACTIVE;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         
-        if (oldStatus == PARTY_STATUS_ACTIVE) {
+        if (oldStatus == PartyStatus.ACTIVE) {
             _activePartiesCount--;
-        } else if (oldStatus == PARTY_STATUS_PENDING) {
+        } else if (oldStatus == PartyStatus.PENDING) {
             _pendingPartiesCount--;
         }
         
-        emit PartyStatusChanged(_partyId, oldStatus, PARTY_STATUS_INACTIVE, msg.sender, block.timestamp);
+        emit PartyStatusChanged(_partyId, uint8(oldStatus), uint8(PartyStatus.INACTIVE), msg.sender, block.timestamp);
     }
 
     /**
@@ -294,15 +365,15 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         whenNotPaused
         nonReentrant
     {
-        if (parties[_partyId].status != PARTY_STATUS_INACTIVE) {
+        if (parties[_partyId].status != PartyStatus.INACTIVE) {
             revert PartyNotInactive();
         }
         
-        parties[_partyId].status = PARTY_STATUS_PENDING;
+        parties[_partyId].status = PartyStatus.PENDING;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         _pendingPartiesCount++;
         
-        emit PartyStatusChanged(_partyId, PARTY_STATUS_INACTIVE, PARTY_STATUS_PENDING, msg.sender, block.timestamp);
+        emit PartyStatusChanged(_partyId, uint8(PartyStatus.INACTIVE), uint8(PartyStatus.PENDING), msg.sender, block.timestamp);
     }
     
     // Group 2: Party Membership Functions
@@ -323,10 +394,16 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         parties[_partyId].members[msg.sender] = true;
         parties[_partyId].memberCount++;
         
-        // Check if new member is verified
+        // Check if new member is orb verified
         bool isVerified = isAddressVerified(msg.sender);
         if (isVerified) {
             parties[_partyId].verifiedMemberCount++;
+        }
+        
+        // Check if new member is document verified
+        bool isDocumentVerified = documentVerifiedMembers[msg.sender];
+        if (isDocumentVerified) {
+            parties[_partyId].documentVerifiedMemberCount++;
         }
         
         _userParties[msg.sender].push(_partyId);
@@ -334,7 +411,117 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         parties[_partyId].stats.memberJoins++;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         
-        emit PartyJoined(_partyId, msg.sender, block.number, block.timestamp, isVerified);
+        emit PartyJoined(_partyId, msg.sender, block.number, block.timestamp, isVerified, isDocumentVerified);
+    }
+
+    /**
+     * @notice Join a political party with World ID verification
+     * @param _partyId ID of the party to join
+     * @param root The root of the Merkle tree
+     * @param nullifierHash The nullifier hash for this proof
+     * @param proof The zero-knowledge proof
+     */
+    function joinPartyWithWorldID(
+        uint256 _partyId,
+        uint256 root,
+        uint256 nullifierHash,
+        uint256[8] calldata proof
+    ) 
+        external 
+        partyExists(_partyId) 
+        whenNotPaused
+        nonReentrant
+    {
+        if (parties[_partyId].members[msg.sender]) {
+            revert AlreadyPartyMember();
+        }
+        
+        // Ensure this nullifier hash hasn't been used before
+        if (nullifierHashes[nullifierHash]) revert NullifierHashAlreadyUsed();
+        
+        // Verify proof of personhood with World ID
+        worldId.verifyProof(
+            root,
+            GROUP_ID,
+            abi.encodePacked(msg.sender).hashToField(),
+            nullifierHash,
+            externalNullifier,
+            proof
+        );
+        
+        // Mark the nullifier hash as used
+        nullifierHashes[nullifierHash] = true;
+        
+        // Mark the user as document verified
+        documentVerifiedMembers[msg.sender] = true;
+        
+        // Join the party
+        parties[_partyId].members[msg.sender] = true;
+        parties[_partyId].memberCount++;
+        
+        // Check if new member is orb verified
+        bool isVerified = isAddressVerified(msg.sender);
+        if (isVerified) {
+            parties[_partyId].verifiedMemberCount++;
+        }
+        
+        // Add to document verified count
+        parties[_partyId].documentVerifiedMemberCount++;
+        
+        _userParties[msg.sender].push(_partyId);
+        
+        parties[_partyId].stats.memberJoins++;
+        parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
+        
+        emit WorldIdVerified(msg.sender, nullifierHash, block.timestamp);
+        emit PartyJoined(_partyId, msg.sender, block.number, block.timestamp, isVerified, true);
+    }
+
+    /**
+     * @notice Verify an existing member with World ID
+     * @param _partyId ID of the party
+     * @param root The root of the Merkle tree
+     * @param nullifierHash The nullifier hash for this proof
+     * @param proof The zero-knowledge proof
+     */
+    function verifyMemberWithWorldID(
+        uint256 _partyId,
+        uint256 root,
+        uint256 nullifierHash,
+        uint256[8] calldata proof
+    ) 
+        external 
+        partyExists(_partyId) 
+        onlyPartyMember(_partyId)
+        whenNotPaused
+        nonReentrant
+    {
+        // Ensure this nullifier hash hasn't been used before
+        if (nullifierHashes[nullifierHash]) revert NullifierHashAlreadyUsed();
+        
+        // Verify proof of personhood with World ID
+        worldId.verifyProof(
+            root,
+            GROUP_ID,
+            abi.encodePacked(msg.sender).hashToField(),
+            nullifierHash,
+            externalNullifier,
+            proof
+        );
+        
+        // Mark the nullifier hash as used
+        nullifierHashes[nullifierHash] = true;
+        
+        // Check if the member was previously document verified
+        bool wasDocumentVerified = documentVerifiedMembers[msg.sender];
+        
+        // Mark the user as document verified if not already
+        if (!wasDocumentVerified) {
+            documentVerifiedMembers[msg.sender] = true;
+            parties[_partyId].documentVerifiedMemberCount++;
+        }
+        
+        emit WorldIdVerified(msg.sender, nullifierHash, block.timestamp);
     }
 
     /**
@@ -352,10 +539,15 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         }
         
         // Check if leaving member is verified before removing
+        bool wasDocumentVerified = documentVerifiedMembers[msg.sender];
         bool wasVerified = isAddressVerified(msg.sender);
         
         parties[_partyId].members[msg.sender] = false;
         parties[_partyId].memberCount--;
+        
+        if (wasDocumentVerified) {
+            parties[_partyId].documentVerifiedMemberCount--;
+        }
         
         if (wasVerified) {
             parties[_partyId].verifiedMemberCount--;
@@ -366,7 +558,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         parties[_partyId].stats.memberLeaves++;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         
-        emit PartyLeft(_partyId, msg.sender, block.number, block.timestamp, wasVerified);
+        emit PartyLeft(_partyId, msg.sender, block.number, block.timestamp, wasDocumentVerified, wasVerified);
     }
     
     /**
@@ -385,10 +577,15 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         if (_member == parties[_partyId].currentLeader) revert CannotRemoveLeader();
         
         // Check if member being removed is verified
+        bool wasDocumentVerified = documentVerifiedMembers[_member];
         bool wasVerified = isAddressVerified(_member);
         
         parties[_partyId].members[_member] = false;
         parties[_partyId].memberCount--;
+        
+        if (wasDocumentVerified) {
+            parties[_partyId].documentVerifiedMemberCount--;
+        }
         
         if (wasVerified) {
             parties[_partyId].verifiedMemberCount--;
@@ -399,7 +596,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         parties[_partyId].stats.memberLeaves++;
         parties[_partyId].stats.lastActivityTimestamp = block.timestamp;
         
-        emit MemberRemoved(_partyId, _member, msg.sender, block.timestamp, wasVerified);
+        emit MemberRemoved(_partyId, _member, msg.sender, block.timestamp, wasDocumentVerified, wasVerified);
     }
     
     // Group 3: Leadership Functions
@@ -420,7 +617,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         if (_newLeader == msg.sender) revert AlreadyLeader();
         
         // For active parties, check if the new leader already leads an active party
-        if (parties[_partyId].status == PARTY_STATUS_ACTIVE) {
+        if (parties[_partyId].status == PartyStatus.ACTIVE) {
             (bool hasLeadership, ) = _hasActiveLeadership(_newLeader);
             if (hasLeadership) {
                 revert NewLeaderAlreadyLeadsActiveParty();
@@ -456,7 +653,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         if (!parties[_partyId].members[_newLeader]) revert NotMember();
         
         // For active parties, check if the new leader already leads an active party
-        if (parties[_partyId].status == PARTY_STATUS_ACTIVE) {
+        if (parties[_partyId].status == PartyStatus.ACTIVE) {
             (bool hasLeadership, uint256 leadPartyId) = _hasActiveLeadership(_newLeader);
             if (hasLeadership && leadPartyId != _partyId) {
                 revert NewLeaderAlreadyLeadsActiveParty();
@@ -587,6 +784,19 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
     function isAddressVerified(address _address) public view returns (bool) {
         return IAddressBook(addressBookContract).addressVerifiedUntil(_address) > 0;
     }
+
+    // ================ WORLD ID FUNCTIONS ================
+
+    /**
+     * @notice Update the World ID contract (owner only)
+     * @param _newWorldId New World ID contract address
+     */
+    function updateWorldId(IWorldID _newWorldId) external onlyOwner nonReentrant {
+        if (address(_newWorldId) == address(0)) revert ZeroAddress();
+        address oldWorldId = address(worldId);
+        worldId = _newWorldId;
+        emit WorldIdUpdated(oldWorldId, address(_newWorldId));
+    }
     
     // ================ VIEW FUNCTIONS ================
     // Party Status & Counts
@@ -600,22 +810,24 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         partyExists(_partyId)
         returns (uint8 status)
     {
-        return parties[_partyId].status;
+        return uint8(parties[_partyId].status);
     }
     
     /**
      * @notice Get party member counts
      * @param _partyId ID of the party
      * @return memberCount Total number of members
+     * @return documentVerifiedMemberCount Number of document-verified members
      * @return verifiedMemberCount Number of verified members
      */
     function getPartyMemberCounts(uint256 _partyId) external view override
         partyExists(_partyId)
-        returns (uint256 memberCount, uint256 verifiedMemberCount) 
+        returns (uint256 memberCount, uint256 documentVerifiedMemberCount, uint256 verifiedMemberCount) 
     {
         memberCount = parties[_partyId].memberCount;
+        documentVerifiedMemberCount = parties[_partyId].documentVerifiedMemberCount;
         verifiedMemberCount = parties[_partyId].verifiedMemberCount;
-        return (memberCount, verifiedMemberCount);
+        return (memberCount, documentVerifiedMemberCount, verifiedMemberCount);
     }
 
     /**
@@ -671,6 +883,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
      * @return creationTime Timestamp when party was created
      * @return status Party status (0=pending, 1=active, 2=inactive)
      * @return memberCount Total number of members
+     * @return documentVerifiedMemberCount Number of document-verified members
      * @return verifiedMemberCount Number of verified members
      */
     function getPartyDetails(uint256 _partyId) external view
@@ -685,6 +898,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
             uint256 creationTime,
             uint8 status,
             uint256 memberCount,
+            uint256 documentVerifiedMemberCount,
             uint256 verifiedMemberCount
         )
     {
@@ -696,8 +910,9 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
         founder = party.founder;
         currentLeader = party.currentLeader;
         creationTime = party.creationTime;
-        status = party.status;
+        status = uint8(party.status);
         memberCount = party.memberCount;
+        documentVerifiedMemberCount = party.documentVerifiedMemberCount;
         verifiedMemberCount = party.verifiedMemberCount;
     }
     
@@ -872,7 +1087,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable, IPolitica
     function _hasActiveLeadership(address _address) internal view returns (bool hasLeadership, uint256 leadPartyId) {
         for (uint256 i = 0; i < _userLeaderships[_address].length; i++) {
             uint256 partyId = _userLeaderships[_address][i];
-            if (parties[partyId].status == PARTY_STATUS_ACTIVE) {
+            if (parties[partyId].status == PartyStatus.ACTIVE) {
                 return (true, partyId);
             }
         }
