@@ -75,7 +75,6 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     error IndexOutOfBounds();
     error InvalidPartyId();
     error InvalidProof();
-    error LeaderCannotLeave();
     error LeaderHasActiveParty();
     error LeadershipActiveElsewhere();
     error NewLeaderAlreadyLeadsActiveParty();
@@ -443,7 +442,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     }
 
     /**
-     * @notice Leave a political party
+     * @notice Leave a political party, with special handling for leaders
      * @param _partyId ID of the party to leave
      */
     function leaveParty(uint256 _partyId) external 
@@ -452,13 +451,22 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         whenNotPaused
         nonReentrant
     {
-        if (msg.sender == parties[_partyId].currentLeader) {
-            revert LeaderCannotLeave();
-        }
-        
         // Check if leaving member is verified before removing
         bool wasDocumentVerified = documentVerifiedMembers[msg.sender];
         bool wasVerified = IAddressBook(addressBookContract).addressVerifiedUntil(msg.sender) > 0;
+        
+        // Special handling for party leaders
+        if (msg.sender == parties[_partyId].currentLeader) {
+            // Mark the party as leaderless (address(0) indicates no leader)
+            address previousLeader = parties[_partyId].currentLeader;
+            parties[_partyId].currentLeader = address(0);
+            
+            // Update leader status
+            isLeader[previousLeader] = false;
+            
+            // Emit leadership change event
+            emit LeadershipTransferred(_partyId, previousLeader, address(0), false, block.timestamp);
+        }
         
         parties[_partyId].members[msg.sender] = false;
         parties[_partyId].memberCount--;
@@ -474,7 +482,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
             parties[_partyId].verifiedMemberCount--;
         }
         
-        emit PartyLeft(_partyId, msg.sender, block.number, block.timestamp, wasDocumentVerified, wasVerified);
+        emit PartyLeft(_partyId, msg.sender, block.number, block.timestamp, wasVerified, wasDocumentVerified);
     }
     
     /**
@@ -558,7 +566,9 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         parties[_partyId].currentLeader = _newLeader;
         
         // Update leader status
-        isLeader[previousLeader] = false;
+        if (previousLeader != address(0)) {
+            isLeader[previousLeader] = false;
+        }
         isLeader[_newLeader] = true;
         
         emit LeadershipTransferred(_partyId, previousLeader, _newLeader, true, block.timestamp);
