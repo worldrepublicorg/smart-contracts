@@ -128,7 +128,17 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
     mapping(address => bool) public isLeader;
     
     // ================ EVENTS ================
-    event PartyCreated(uint256 indexed partyId, string name, string shortName, address indexed founder, address indexed initialLeader, uint256 timestamp);
+    event PartyCreated(
+        uint256 indexed partyId, 
+        string name, 
+        string shortName, 
+        string description,
+        string officialLink,
+        address indexed founder, 
+        address indexed initialLeader, 
+        uint8 status,
+        uint256 timestamp
+    );
     event PartyJoined(uint256 indexed partyId, address indexed member, uint256 blockNumber, uint256 timestamp, bool isVerified, bool isDocumentVerified);
     event PartyLeft(uint256 indexed partyId, address indexed member, uint256 blockNumber, uint256 timestamp, bool wasVerified, bool wasDocumentVerified);
     event MemberRemoved(uint256 indexed partyId, address indexed member, address indexed remover, uint256 timestamp, bool wasVerified, bool wasDocumentVerified);
@@ -277,7 +287,17 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
         
         pendingPartiesCount++;
         
-        emit PartyCreated(newPartyId, _name, _shortName, msg.sender, msg.sender, block.timestamp);
+        emit PartyCreated(
+            newPartyId, 
+            _name, 
+            _shortName, 
+            _description,
+            _officialLink,
+            msg.sender, 
+            msg.sender, 
+            uint8(PartyStatus.PENDING),
+            block.timestamp
+        );
         return newPartyId;
     }
 
@@ -518,7 +538,7 @@ contract PoliticalPartyRegistry is ReentrancyGuard, Pausable, Ownable {
             parties[_partyId].verifiedMemberCount--;
         }
         
-        emit MemberRemoved(_partyId, _member, msg.sender, block.timestamp, wasDocumentVerified, wasVerified);
+        emit MemberRemoved(_partyId, _member, msg.sender, block.timestamp, wasVerified, wasDocumentVerified);
     }
     
     // -------- Leadership Functions --------
